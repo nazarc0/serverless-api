@@ -2,11 +2,17 @@ import json
 import os
 import pg8000
 import base64
+import boto3
+import uuid
 
 DB_HOST = os.environ.get("DB_HOST")
 DB_NAME = os.environ.get("DB_NAME")
 DB_USER = os.environ.get("DB_USER")
 DB_PASS = os.environ.get("DB_PASS")
+BUCKET = os.environ.get("BUCKET_NAME")
+
+rekognition = boto3.client("rekognition")
+s3 = boto3.client("s3")
 
 
 def get_connection():
@@ -43,38 +49,62 @@ def parse_body(event):
         print("BAD BODY:", body)
 
     # fallback
-    try:
-        body = body.strip("{}")
-        parts = body.split(",")
+    body = body.strip("{}")
+    parts = body.split(",")
 
-        result = {}
-        for p in parts:
-            if ":" not in p:
-                continue
-            k, v = p.split(":", 1)
-            result[k.strip().strip('"')] = v.strip().strip('"')
+    result = {}
+    for p in parts:
+        if ":" not in p:
+            continue
+        k, v = p.split(":", 1)
+        result[k.strip().strip('"')] = v.strip().strip('"')
 
-        return result
-    except Exception as e:
-        print("FALLBACK FAILED:", body)
-        raise e
+    return result
+
+
+# 🔥 Rekognition + S3
+def process_image(image_b64):
+    image_bytes = base64.b64decode(image_b64)
+
+    key = f"uploads/{uuid.uuid4()}.jpg"
+
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=key,
+        Body=image_bytes
+    )
+
+    response = rekognition.detect_labels(
+        Image={
+            "S3Object": {
+                "Bucket": BUCKET,
+                "Name": key
+            }
+        },
+        MaxLabels=10,
+        MinConfidence=80
+    )
+
+    labels = [l["Name"] for l in response["Labels"]]
+
+    return labels
 
 
 def handler(event, context):
     try:
         print("EVENT:", json.dumps(event))
 
-        # 🔥 СТАБІЛЬНИЙ ФІКС МЕТОДУ
         method = (
             event.get("requestContext", {}).get("http", {}).get("method")
             or event.get("httpMethod")
             or ""
         )
 
+        path = event.get("rawPath", "")
+
         conn = get_connection()
         cursor = conn.cursor()
 
-        # таблиця
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS equipment (
                 id SERIAL PRIMARY KEY,
@@ -85,9 +115,42 @@ def handler(event, context):
         conn.commit()
 
         # =====================
+        # 📸 POST /equipment/{id}/photo
+        # =====================
+        if method == "POST" and "/photo" in path:
+            body = parse_body(event)
+
+            image = body.get("image")
+
+            # 🔥 ФІКС ID ДЛЯ HTTP API v2
+            parts = path.split("/")
+            equipment_id = parts[2] if len(parts) >= 3 else None
+
+            if not image or not equipment_id:
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": "Missing image or id"})
+                }
+
+            labels = process_image(image)
+
+            cursor.execute(
+                "UPDATE equipment SET status = $1 WHERE id = $2;",
+                (",".join(labels), equipment_id)
+            )
+            conn.commit()
+
+            return {
+                "statusCode": 200,
+                "body": json.dumps({
+                    "labels": labels
+                })
+            }
+
+        # =====================
         # ➕ POST
         # =====================
-        if method == "POST":
+        elif method == "POST":
             body = parse_body(event)
 
             name = body.get("name", "Unknown")
@@ -111,7 +174,7 @@ def handler(event, context):
             }
 
         # =====================
-        # 🔍 GET (З ФІЛЬТРОМ)
+        # 🔍 GET
         # =====================
         elif method == "GET":
             params = event.get("queryStringParameters") or {}
@@ -123,9 +186,7 @@ def handler(event, context):
                     (status,)
                 )
             else:
-                cursor.execute(
-                    "SELECT id, name, status FROM equipment;"
-                )
+                cursor.execute("SELECT id, name, status FROM equipment;")
 
             rows = cursor.fetchall()
 
@@ -141,7 +202,7 @@ def handler(event, context):
             }
 
         # =====================
-        # 🔄 PUT (НОВЕ)
+        # 🔄 PUT
         # =====================
         elif method == "PUT":
             body = parse_body(event)
@@ -164,7 +225,6 @@ def handler(event, context):
 
             return {
                 "statusCode": 200,
-                "headers": {"Content-Type": "application/json"},
                 "body": json.dumps({"message": "Updated"})
             }
 
@@ -177,8 +237,5 @@ def handler(event, context):
         print("ERROR:", str(e))
         return {
             "statusCode": 500,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps({
-                "error": str(e)
-            })
+            "body": json.dumps({"error": str(e)})
         }

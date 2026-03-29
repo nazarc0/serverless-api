@@ -6,6 +6,15 @@ locals {
   prefix = "lomachynskyi-nazar-10"
 }
 
+# 🔥 S3 для AI
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
+resource "aws_s3_bucket" "images" {
+  bucket = "lab4-images-${random_id.suffix.hex}"
+}
+
 # RDS
 module "database" {
   source      = "../../modules/rds"
@@ -24,14 +33,17 @@ module "backend" {
   db_name     = module.database.db_name
   db_user     = module.database.db_user
   db_password = "Password123!"
+
+  # 🔥 AI bucket
+  bucket_name = aws_s3_bucket.images.bucket
 }
 
 # API Gateway
 module "api" {
-  source                 = "../../modules/api_gateway"
-  api_name               = "${local.prefix}-api"
-  lambda_invoke_arn      = module.backend.invoke_arn
-  lambda_function_name   = module.backend.function_name
+  source               = "../../modules/api_gateway"
+  api_name             = "${local.prefix}-api"
+  lambda_invoke_arn    = module.backend.invoke_arn
+  lambda_function_name = module.backend.function_name
 }
 
 output "api_url" {
